@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/tarm/serial"
 )
 
 // JSON структуры для сообщений (должны совпадать с сервером)
@@ -36,6 +37,9 @@ type ChatClient struct {
 	running       bool
 	consoleReader *bufio.Reader
 	done          chan struct{}
+	comPortName   string
+	comBaudRate   int
+	comPort       *serial.Port
 }
 
 func NewChatClient(server string, port int) *ChatClient {
@@ -46,6 +50,42 @@ func NewChatClient(server string, port int) *ChatClient {
 		consoleReader: bufio.NewReader(os.Stdin),
 		done:          make(chan struct{}),
 	}
+}
+
+// Initializes COM port if configured
+func (c *ChatClient) initCOMPort(name string, baud int) error {
+	c.comPortName = strings.TrimSpace(name)
+	c.comBaudRate = baud
+	if c.comPortName == "" {
+		return nil
+	}
+
+	cfg := &serial.Config{Name: c.comPortName, Baud: c.comBaudRate}
+	p, err := serial.OpenPort(cfg)
+	if err != nil {
+		return fmt.Errorf("не удалось открыть COM порт %s: %v", c.comPortName, err)
+	}
+	c.comPort = p
+	fmt.Printf("🔌 Открыт COM порт %s @ %d бод\n", c.comPortName, c.comBaudRate)
+	return nil
+}
+
+// Writes text to COM port skipping every 2nd rune (keeps 1st, 3rd, ...)
+func (c *ChatClient) writeToCOM(text string) {
+	if c.comPort == nil || text == "" {
+		return
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	idx := 0
+	for _, r := range text {
+		if idx%2 == 0 {
+			b.WriteRune(r)
+		}
+		idx++
+	}
+	filtered := b.String() + "\r\n"
+	_, _ = c.comPort.Write([]byte(filtered))
 }
 
 func (c *ChatClient) Connect() error {
@@ -323,21 +363,25 @@ func (c *ChatClient) handleServerMessage(msg *Message) {
 	case "chat":
 		// Обычное сообщение в чат
 		c.printChatMessage(msg)
+		c.writeToCOM(msg.Content)
 	case "private":
 		// Личное сообщение
 		c.printPrivateMessage(msg)
+		c.writeToCOM(msg.Content)
 	case "private_sent":
 		// Подтверждение отправки личного сообщения - не показываем
 		// Просто игнорируем это сообщение
 	case "mass_private":
 		// Массовое личное сообщение
 		c.printMassPrivateMessage(msg)
+		c.writeToCOM(msg.Content)
 	case "mass_private_sent":
 		// Подтверждение отправки массового сообщения - не показываем
 		// Просто игнорируем это сообщение
 	case "system":
 		// Системное сообщение
 		c.printSystemMessage(msg)
+		c.writeToCOM(msg.Content)
 	case "users":
 		// Список пользователей
 		c.handleUserList(msg)
@@ -347,39 +391,50 @@ func (c *ChatClient) handleServerMessage(msg *Message) {
 	case "mailbox_status":
 		// Статус почтового ящика
 		c.printMailboxStatus(msg)
+		c.writeToCOM(msg.Content)
 	case "offline_message":
 		// Отложенное сообщение
 		c.printOfflineMessage(msg)
+		c.writeToCOM(msg.Content)
 	case "offline_delivered":
 		// Уведомление о доставке отложенных сообщений
 		c.printOfflineDelivered(msg)
+		c.writeToCOM(msg.Content)
 	case "offline_saved":
 		// Сообщение сохранено для оффлайн пользователя
 		c.printOfflineSaved(msg)
+		c.writeToCOM(msg.Content)
 	case "fav_list":
 		// Список любимых писателей
 		c.handleFavList(msg)
 	case "fav_added":
 		// Пользователь добавлен в любимые
 		c.printFavAdded(msg)
+		c.writeToCOM(msg.Content)
 	case "fav_removed":
 		// Пользователь удален из любимых
 		c.printFavRemoved(msg)
+		c.writeToCOM(msg.Content)
 	case "fav_cleared":
 		// Список любимых очищен
 		c.printFavCleared(msg)
+		c.writeToCOM(msg.Content)
 	case "blocked":
 		// Пользователь заблокирован
 		c.printBlocked(msg)
+		c.writeToCOM(msg.Content)
 	case "unblocked":
 		// Пользователь разблокирован
 		c.printUnblocked(msg)
+		c.writeToCOM(msg.Content)
 	case "color_set":
 		// Цвет установлен
 		c.printColorSet(msg)
+		c.writeToCOM(msg.Content)
 	case "error":
 		// Ошибка
 		c.printError(msg)
+		c.writeToCOM(msg.Error)
 	default:
 		fmt.Printf("❓ Неизвестный тип сообщения: %s\n", msg.Type)
 	}
@@ -572,6 +627,10 @@ func (c *ChatClient) cleanup() {
 		time.Sleep(time.Second) // Даем время на отправку сообщения
 		c.conn.Close()
 	}
+    if c.comPort != nil {
+        c.comPort.Close()
+        fmt.Println("✅ COM порт закрыт")
+    }
 	fmt.Println("✅ WebSocket соединение закрыто")
 }
 
@@ -614,12 +673,57 @@ func getServerAddress() (string, int) {
 	return serverInput, 12345
 }
 
+func getCOMPortConfig() (string, int) {
+	// If stdin is not a TTY (e.g., launched without console), use env vars
+	if fi, err := os.Stdin.Stat(); err == nil && (fi.Mode()&os.ModeCharDevice) == 0 {
+		name := strings.TrimSpace(os.Getenv("CLIENT_COM_PORT"))
+		baud := 9600
+		if b := strings.TrimSpace(os.Getenv("CLIENT_COM_BAUD")); b != "" {
+			if v, err := strconv.Atoi(b); err == nil && v > 0 {
+				baud = v
+			}
+		}
+		if name != "" {
+			fmt.Printf("(non-interactive) Используем COM из переменных окружения: %s @ %d\n", name, baud)
+		}
+		return name, baud
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Print("Укажите COM порт (например, COM3). Пусто чтобы пропустить: ")
+	name, _ := reader.ReadString('\n')
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", 0
+	}
+
+	fmt.Print("Скорость (бод), по умолчанию 9600: ")
+	baudStr, _ := reader.ReadString('\n')
+	baudStr = strings.TrimSpace(baudStr)
+	baud := 9600
+	if baudStr != "" {
+		if v, err := strconv.Atoi(baudStr); err == nil && v > 0 {
+			baud = v
+		}
+	}
+	return name, baud
+}
+
 func main() {
 	server, port := getServerAddress()
 
 	fmt.Printf("Подключение к %s:%d...\n", server, port)
 
-	client := NewChatClient(server, port)
+    client := NewChatClient(server, port)
+
+    // COM port setup
+    comName, comBaud := getCOMPortConfig()
+    if comName != "" {
+        if err := client.initCOMPort(comName, comBaud); err != nil {
+            fmt.Printf("❌ %v\n", err)
+        }
+    }
 	go client.WaitForInterrupt()
 
 	err := client.Connect()
