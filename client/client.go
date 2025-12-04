@@ -70,20 +70,41 @@ func (c *ChatClient) initCOMPort(name string, baud int) error {
 	return nil
 }
 
-// Writes text to COM port skipping every 2nd rune (keeps 1st, 3rd, ...)
+// Writes text to COM port with nickname: prefix full, then content filtered (keeps 1st, 3rd, ...)
 func (c *ChatClient) writeToCOM(text string) {
 	if c.comPort == nil || text == "" {
 		return
 	}
 	var b strings.Builder
 	b.Grow(len(text))
-	idx := 0
-	for _, r := range text {
-		if idx%2 == 0 {
-			b.WriteRune(r)
+	
+	// Find the position of ": " separator
+	sepIdx := strings.Index(text, ": ")
+	if sepIdx == -1 {
+		// No separator found, filter the entire text
+		idx := 0
+		for _, r := range text {
+			if idx%2 == 0 {
+				b.WriteRune(r)
+			}
+			idx++
 		}
-		idx++
+	} else {
+		// Write nickname and ": " fully
+		prefix := text[:sepIdx+2]
+		b.WriteString(prefix)
+		
+		// Filter the message content (skip every 2nd character)
+		content := text[sepIdx+2:]
+		idx := 0
+		for _, r := range content {
+			if idx%2 == 0 {
+				b.WriteRune(r)
+			}
+			idx++
+		}
 	}
+	
 	filtered := b.String() + "\r\n"
 	_, _ = c.comPort.Write([]byte(filtered))
 }
@@ -363,25 +384,24 @@ func (c *ChatClient) handleServerMessage(msg *Message) {
 	case "chat":
 		// Обычное сообщение в чат
 		c.printChatMessage(msg)
-		c.writeToCOM(msg.Content)
+		c.writeToCOM(msg.From + ": " + msg.Content)
 	case "private":
 		// Личное сообщение
 		c.printPrivateMessage(msg)
-		c.writeToCOM(msg.Content)
+		c.writeToCOM(msg.From + ": " + msg.Content)
 	case "private_sent":
 		// Подтверждение отправки личного сообщения - не показываем
 		// Просто игнорируем это сообщение
 	case "mass_private":
 		// Массовое личное сообщение
 		c.printMassPrivateMessage(msg)
-		c.writeToCOM(msg.Content)
+		c.writeToCOM(msg.From + ": " + msg.Content)
 	case "mass_private_sent":
 		// Подтверждение отправки массового сообщения - не показываем
 		// Просто игнорируем это сообщение
 	case "system":
 		// Системное сообщение
 		c.printSystemMessage(msg)
-		c.writeToCOM(msg.Content)
 	case "users":
 		// Список пользователей
 		c.handleUserList(msg)
@@ -395,7 +415,7 @@ func (c *ChatClient) handleServerMessage(msg *Message) {
 	case "offline_message":
 		// Отложенное сообщение
 		c.printOfflineMessage(msg)
-		c.writeToCOM(msg.Content)
+		c.writeToCOM(msg.From + ": " + msg.Content)
 	case "offline_delivered":
 		// Уведомление о доставке отложенных сообщений
 		c.printOfflineDelivered(msg)
